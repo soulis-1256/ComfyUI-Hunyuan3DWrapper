@@ -112,13 +112,23 @@ class MCSurfaceExtractor(SurfaceExtractor):
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: Tuple containing:
-                - vertices (np.ndarray): Extracted mesh vertices, scaled and translated to bounding 
+                - vertices (np.ndarray): Extracted mesh vertices, scaled and translated to bounding
                   box coordinates.
                 - faces (np.ndarray): Extracted mesh faces (triangles).
         """
-        vertices, faces, normals, _ = measure.marching_cubes(grid_logit.cpu().numpy(),
-                                                             mc_level,
-                                                             method="lewiner")
+        # Get data range and clamp mc_level to valid range
+        grid_logit_np = grid_logit.cpu().numpy()
+        data_min = float(grid_logit_np.min())
+        data_max = float(grid_logit_np.max())
+        
+        # Clamp mc_level to be within data range with small margin
+        margin = (data_max - data_min) * 0.01
+        clamped_level = max(data_min + margin, min(data_max - margin, mc_level))
+        
+        if clamped_level != mc_level:
+            print(f"[Warning] mc_level {mc_level} outside data range [{data_min}, {data_max}], using {clamped_level}")
+        
+        vertices, faces, normals, _ = measure.marching_cubes(grid_logit_np, clamped_level, method="lewiner")
         grid_size, bbox_min, bbox_size = self._compute_box_stat(bounds, octree_resolution)
         vertices = vertices / grid_size * bbox_size + bbox_min
         return vertices, faces

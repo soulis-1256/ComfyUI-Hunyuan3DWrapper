@@ -150,89 +150,84 @@ class Hunyuan3DDiTPipeline:
     def from_single_file(
         cls,
         ckpt_path,
+        config_path=None,
         device='cuda',
         offload_device=torch.device('cpu'),
         dtype=torch.float16,
-        use_safetensors=None,
-        compile_args=None,
-        attention_mode="sdpa",
-        cublas_ops=False,
-        scheduler="FlowMatchEulerDiscreteScheduler", 
         **kwargs,
     ):
-        new_sd = {}
+        import yaml
+        from comfy.utils import load_torch_file
+        
+        print(f"[Debug] ckpt_path: {ckpt_path}")
+        print(f"[Debug] config_path (in): {config_path}")
+        
+        # 1. Load Checkpoint
         sd = load_torch_file(ckpt_path)
-        if ckpt_path.endswith('.safetensors'):
-            for key, value in sd.items():
-                model_name = key.split('.')[0]
-                new_key = key[len(model_name) + 1:]
-                if model_name not in new_sd:
-                    new_sd[model_name] = {}
-                new_sd[model_name][new_key] = value
+        print(f"[Debug] sd keys: {list(sd.keys())[:5]}")
+        
+        # 2. Determine Config Path if not provided
+        if config_path is None:
+            script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            config_path = os.path.join(script_dir, "configs", "dit_config_2_1.yaml")
+            print(f"[Debug] config_path (auto): {config_path}")
 
-        script_directory = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        # load config
-
-        single_block_nums = set()
-        for k in new_sd["model"].keys():
-            if k.startswith('single_blocks.'):
-                block_num = int(k.split('.')[1])
-                single_block_nums.add(block_num)
-    
-        if len(single_block_nums) < 17:
-            config_path = os.path.join(script_directory, "configs", "dit_config_mini.yaml")
-            logger.info(f"Model has {len(single_block_nums)} single blocks, setting config to dit_config_mini.yaml")
-        else:
-            config_path = os.path.join(script_directory, "configs", "dit_config.yaml")
+        # 3. Load Config
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
+        print(f"[Debug] config keys: {list(config.keys()) if isinstance(config, dict) else 'Not a dict'}")
+            
+        # 4. Extract sub-dicts
+        def get_sd(prefix):
+            if prefix in sd and isinstance(sd[prefix], dict):
+                return sd[prefix]
+            res = {}
+            p_dot = prefix + "."
+            for k, v in sd.items():
+                if k.startswith(p_dot):
+                    res[k[len(p_dot):]] = v
+            return res if res else sd
 
+        # 5. Instantiate and load weights
+        from accelerate import init_empty_weights
+        from accelerate.utils import set_module_tensor_to_device
         
-        # load model
-        if "guidance_in.in_layer.bias" in new_sd['model']: #guidance_in.in_layer.bias
-            logger.info("Model has guidance_in, setting guidance_embed to True")
-            config['model']['params']['guidance_embed'] = True
-            config['conditioner']['params']['main_image_encoder']['kwargs']['has_guidance_embed'] = True
-        config['model']['params']['attention_mode'] = attention_mode
-        #config['vae']['params']['attention_mode'] = attention_mode
+        def fast_load(comp_name):
+            if not isinstance(config, dict):
+                print(f"[Debug] Config is not a dict: {config}")
+                return None
+            conf = config.get(comp_name)
+            if not conf:
+                print(f"[Debug] Component {comp_name} not found in config")
+                return None
+            
+            # Patch config if guidance exists
+            comp_sd = get_sd(comp_name)
+            if comp_name == 'model' and "guidance_in.in_layer.bias" in comp_sd:
+                print("[Debug] Enabling guidance_embed")
+                conf['params']['guidance_embed'] = True
+                if 'conditioner' in config:
+                    try: config['conditioner']['params']['main_image_encoder']['kwargs']['has_guidance_embed'] = True
+                    except: pass
 
-        #if cublas_ops:
-        #    config['vae']['params']['cublas_ops'] = True
-        
-        with init_empty_weights():
-            model = instantiate_from_config(config['model'])
-            vae = instantiate_from_config(config['vae'])
-            conditioner = instantiate_from_config(config['conditioner'])
-        #model
-        for name, param in model.named_parameters():
-            set_module_tensor_to_device(model, name, device=offload_device, dtype=dtype, value=new_sd['model'][name])
-        #vae
-        for name, param in vae.named_parameters():
-            set_module_tensor_to_device(vae, name, device=offload_device, dtype=dtype, value=new_sd['vae'][name])       
-        
-        if 'conditioner' in new_sd:
-            #conditioner.load_state_dict(ckpt['conditioner'])
-            for name, param in conditioner.named_parameters():
-                set_module_tensor_to_device(conditioner, name, device=offload_device, dtype=dtype, value=new_sd['conditioner'][name])
+            obj = instantiate_from_config(conf)
+            for name, _ in obj.named_parameters():
+                if name in comp_sd:
+                    set_module_tensor_to_device(obj, name, device=offload_device, dtype=dtype, value=comp_sd[name])
+            return obj
 
+        model = fast_load('model')
+        vae = fast_load('vae')
+        conditioner = fast_load('conditioner')
         image_processor = instantiate_from_config(config['image_processor'])
-
-        if scheduler == "FlowMatchEulerDiscreteScheduler":
-            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
-        elif scheduler == "ConsistencyFlowMatchEulerDiscreteScheduler":
-            scheduler = ConsistencyFlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, pcm_timesteps=100)
         
-        #scheduler = instantiate_from_config(config['scheduler'])
-
-        if compile_args is not None:
-            torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
-            if compile_args["compile_transformer"]:
-                model = torch.compile(model)
-            if compile_args["compile_vae"]:
-                vae = torch.compile(vae)
+        sched_type = kwargs.get('scheduler', 'FlowMatchEulerDiscreteScheduler')
+        if sched_type == "FlowMatchEulerDiscreteScheduler":
+            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+        else:
+            scheduler = ConsistencyFlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, pcm_timesteps=100)
 
         model_kwargs = dict(
-            #vae=vae,
             model=model,
             scheduler=scheduler,
             conditioner=conditioner,
@@ -242,8 +237,9 @@ class Hunyuan3DDiTPipeline:
             dtype=dtype,
         )
         model_kwargs.update(kwargs)
-
+        
         return cls(**model_kwargs), vae
+
 
     def __init__(
         self,

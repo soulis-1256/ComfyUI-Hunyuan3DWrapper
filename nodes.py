@@ -167,7 +167,7 @@ class Hy3D_2_1SimpleMeshGen:
 
         model_path = folder_paths.get_full_path("diffusion_models", model)
         if not hasattr(self, "pipeline"):
-            self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
+            self.pipeline, _ = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
                 config_path=os.path.join(script_directory, 'configs', 'dit_config_2_1.yaml'),
                 ckpt_path=model_path)
         

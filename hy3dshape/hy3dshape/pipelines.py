@@ -23,6 +23,7 @@ import torch
 import trimesh
 import yaml
 from PIL import Image
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.utils.import_utils import is_accelerate_version, is_accelerate_available
 from tqdm import tqdm
@@ -94,6 +95,14 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+
+
+# Stub class for compatibility - falls back to FlowMatchEulerDiscreteScheduler behavior
+class ConsistencyFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
+    def __init__(self, num_train_timesteps=1000, pcm_timesteps=100, **kwargs):
+        super().__init__(num_train_timesteps=num_train_timesteps, **kwargs)
+        self.pcm_timesteps = pcm_timesteps
+
 @synchronize_timer('Export to trimesh')
 def export_to_trimesh(mesh_output):
     if isinstance(mesh_output, list):
@@ -143,63 +152,96 @@ class Hunyuan3DDiTPipeline:
     def from_single_file(
         cls,
         ckpt_path,
-        config_path,
+        config_path=None,
         device='cuda',
+        offload_device=torch.device('cpu'),
         dtype=torch.float16,
-        use_safetensors=None,
         **kwargs,
     ):
-        # load config
+        import yaml
+        from comfy.utils import load_torch_file
+        
+        print(f"[Debug] ckpt_path: {ckpt_path}")
+        print(f"[Debug] config_path (in): {config_path}")
+        
+        # 1. Load Checkpoint
+        sd = load_torch_file(ckpt_path)
+        print(f"[Debug] sd keys: {list(sd.keys())[:5]}")
+        
+        # 2. Determine Config Path if not provided
+        if config_path is None:
+            script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            config_path = os.path.join(script_dir, "configs", "dit_config_2_1.yaml")
+            print(f"[Debug] config_path (auto): {config_path}")
+
+        # 3. Load Config
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
+        print(f"[Debug] config keys: {list(config.keys()) if isinstance(config, dict) else 'Not a dict'}")
+            
+        # 4. Extract sub-dicts
+        def get_sd(prefix):
+            if prefix in sd and isinstance(sd[prefix], dict):
+                return sd[prefix]
+            res = {}
+            p_dot = prefix + "."
+            for k, v in sd.items():
+                if k.startswith(p_dot):
+                    res[k[len(p_dot):]] = v
+            return res if res else sd
 
-        # # load ckpt
-        # if use_safetensors:
-        #     ckpt_path = ckpt_path.replace('.ckpt', '.safetensors')
-        # if not os.path.exists(ckpt_path):
-        #     raise FileNotFoundError(f"Model file {ckpt_path} not found")
-        # logger.info(f"Loading model from {ckpt_path}")
+        # 5. Instantiate and load weights
+        from accelerate import init_empty_weights
+        from accelerate.utils import set_module_tensor_to_device
+        
+        def fast_load(comp_name):
+            if not isinstance(config, dict):
+                print(f"[Debug] Config is not a dict: {config}")
+                return None
+            conf = config.get(comp_name)
+            if not conf:
+                print(f"[Debug] Component {comp_name} not found in config")
+                return None
+            
+            # Patch config if guidance exists
+            comp_sd = get_sd(comp_name)
+            if comp_name == 'model' and "guidance_in.in_layer.bias" in comp_sd:
+                print("[Debug] Enabling guidance_embed")
+                conf['params']['guidance_embed'] = True
+                if 'conditioner' in config:
+                    try: config['conditioner']['params']['main_image_encoder']['kwargs']['has_guidance_embed'] = True
+                    except: pass
 
-        # if use_safetensors:
-        #     # parse safetensors
-        #     import safetensors.torch
-        #     safetensors_ckpt = safetensors.torch.load_file(ckpt_path, device='cpu')
-        #     ckpt = {}
-        #     for key, value in safetensors_ckpt.items():
-        #         model_name = key.split('.')[0]
-        #         new_key = key[len(model_name) + 1:]
-        #         if model_name not in ckpt:
-        #             ckpt[model_name] = {}
-        #         ckpt[model_name][new_key] = value
-        # else:
-        #     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+            obj = instantiate_from_config(conf)
+            for name, _ in obj.named_parameters():
+                if name in comp_sd:
+                    set_module_tensor_to_device(obj, name, device=offload_device, dtype=dtype, value=comp_sd[name])
+            return obj
 
-        ckpt = load_torch_file(ckpt_path)
-        # load model
-        model = instantiate_from_config(config['model'])
-        model.load_state_dict(ckpt['model'])
-        vae = instantiate_from_config(config['vae'])
-        vae.load_state_dict(ckpt['vae'], strict=False)
-        conditioner = instantiate_from_config(config['conditioner'])
-        if 'conditioner' in ckpt:
-            conditioner.load_state_dict(ckpt['conditioner'])
+        model = fast_load('model')
+        vae = fast_load('vae')
+        conditioner = fast_load('conditioner')
         image_processor = instantiate_from_config(config['image_processor'])
-        scheduler = instantiate_from_config(config['scheduler'])
+        
+        sched_type = kwargs.get('scheduler', 'FlowMatchEulerDiscreteScheduler')
+        if sched_type == "FlowMatchEulerDiscreteScheduler":
+            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+        else:
+            scheduler = ConsistencyFlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, pcm_timesteps=100)
 
         model_kwargs = dict(
-            vae=vae,
             model=model,
             scheduler=scheduler,
             conditioner=conditioner,
             image_processor=image_processor,
             device=device,
+            offload_device=offload_device,
             dtype=dtype,
         )
         model_kwargs.update(kwargs)
+        model_kwargs['vae'] = vae
 
-        return cls(
-            **model_kwargs
-        )
+        return cls(**model_kwargs), vae
 
     @classmethod
     def from_pretrained(
